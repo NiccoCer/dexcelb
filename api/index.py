@@ -11,7 +11,7 @@ import json
 COL_CONVERTITA = "CONVERTITA"
 COL_NON_CONV = "PASSATA NON CONVERTITA"
 MERGE_KEY_COLS = ["NOME", "COGNOME", "ZONA"]
-DB_PATH = "db_master.xlsx" # Percorso fisso per il DB su Vercel
+DB_PATH = "db_master.xlsx" # Assicurati che questo file sia nel tuo repository!
 CONFIG_FILE = "dexcelb_templates.json"
 
 DEFAULT_TEMPLATE_CONVERTITA = (
@@ -41,6 +41,7 @@ def trova_indice_colonna(ws, header_name):
     return None
 
 def carica_dati_da_file(filepath):
+    # Resilienza: se il DB non esiste, restituisce liste vuote
     if not os.path.exists(filepath):
         return [], []
 
@@ -80,13 +81,15 @@ def importa_dati_da_buffer(db_path, file_content):
         raise ValueError("File Excel sorgente non valido.")
     
     righe_copiate = 0
+    # Determina il numero di colonne del DB master
+    master_cols = wb_db.active.max_column
+    
     for i, row in enumerate(ws_src.iter_rows(values_only=True), start=1):
         if i == 1:
             continue
         if all(cell is None for cell in row):
             continue
-        # Assicurati che le righe abbiano lo stesso numero di colonne del master
-        master_cols = wb_db.active.max_column
+            
         row_list = list(row)
         if len(row_list) > master_cols:
             row_list = row_list[:master_cols]
@@ -211,7 +214,6 @@ def aggiungi_riga_manuale(db_path, row_values):
     headers = [cell.value for cell in ws[1]]
     num_col = len(headers)
     
-    # Ensure row_values has the correct length
     row_list = [str(v).strip() for v in row_values]
     if len(row_list) > num_col:
         row_list = row_list[:num_col]
@@ -226,18 +228,18 @@ def aggiungi_riga_manuale(db_path, row_values):
 
 def carica_templates():
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return {
-                "convertita": data.get("convertita", DEFAULT_TEMPLATE_CONVERTITA),
-                "non_convertita": data.get("non_convertita", DEFAULT_TEMPLATE_NON_CONV),
-            }
-        else:
-            # Crea il file se non esiste con i default
-            salva_templates(DEFAULT_TEMPLATE_CONVERTITA, DEFAULT_TEMPLATE_NON_CONV)
-            return carica_templates()
+        # Crea il file se non esiste o prova a caricarlo
+        if not os.path.exists(CONFIG_FILE):
+             salva_templates(DEFAULT_TEMPLATE_CONVERTITA, DEFAULT_TEMPLATE_NON_CONV)
+
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "convertita": data.get("convertita", DEFAULT_TEMPLATE_CONVERTITA),
+            "non_convertita": data.get("non_convertita", DEFAULT_TEMPLATE_NON_CONV),
+        }
     except Exception:
+        # Fallback in caso di errore di lettura del JSON
         return {
             "convertita": DEFAULT_TEMPLATE_CONVERTITA,
             "non_convertita": DEFAULT_TEMPLATE_NON_CONV,
@@ -257,12 +259,16 @@ app = FastAPI()
 
 @app.get("/api/data")
 async def get_data():
-    """Restituisce le colonne e tutte le righe dal DB."""
+    """Restituisce le colonne e tutte le righe dal DB. Resiliente a DB mancante."""
     try:
+        if not os.path.exists(DB_PATH):
+            return {"colonne": [], "righe": [], "db_name": f"(Manca {DB_PATH}, carica file iniziale)"}
+            
         colonne, righe = carica_dati_da_file(DB_PATH)
         return {"colonne": colonne, "righe": righe, "db_name": os.path.basename(DB_PATH)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore caricamento dati: {e}")
+        # Errore grave (es. file corrotto)
+        raise HTTPException(status_code=500, detail=f"Errore caricamento dati dal DB: {e}")
 
 @app.post("/api/import")
 async def import_file(file: UploadFile = File(...)):
@@ -271,6 +277,8 @@ async def import_file(file: UploadFile = File(...)):
         content = await file.read()
         righe_copiate = importa_dati_da_buffer(DB_PATH, content)
         return {"messaggio": f"Importazione completata. Righe copiate: {righe_copiate}"}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Errore: {e}. Devi prima caricare il file db_master.xlsx nel repo.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore importazione: {e}")
 
@@ -281,6 +289,8 @@ async def merge_files(files: list[UploadFile] = File(...)):
         file_contents = [await f.read() for f in files]
         files_trovati, nuovi = unisci_file_lista(DB_PATH, file_contents)
         return {"messaggio": f"Unione completata. File elaborati: {files_trovati}, Nuove righe aggiunte: {nuovi}"}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Errore: {e}. Devi prima caricare il file db_master.xlsx nel repo.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore unione: {e}")
 
@@ -295,6 +305,10 @@ async def set_row_status(data: dict):
         
         aggiorna_stato_riga(DB_PATH, riga_excel, convertita, non_convertita, pulisci)
         return {"messaggio": f"Stato riga {riga_excel} aggiornato."}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Errore: {e}. Devi prima caricare il file db_master.xlsx nel repo.")
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Errore: {e}. Controlla che le colonne CONVERTITA/NON CONVERTITA esistano nel DB.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore aggiornamento stato: {e}")
 
@@ -308,6 +322,8 @@ async def add_manual_row(data: dict):
             
         aggiungi_riga_manuale(DB_PATH, row_values)
         return {"messaggio": "Riga aggiunta manualmente con successo."}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Errore: {e}. Devi prima caricare il file db_master.xlsx nel repo.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore aggiunta riga: {e}")
 
@@ -332,3 +348,14 @@ async def save_templates_api(data: dict):
         return {"messaggio": "Template salvati con successo."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Errore salvataggio template: {e}")
+
+# Endpoint di diagnostica aggiunto per il debugging
+@app.get("/api/diagnostics")
+async def diagnostics():
+    """Verifica lo stato del file DB e delle dipendenze."""
+    return {
+        "db_path": DB_PATH,
+        "db_exists": os.path.exists(DB_PATH),
+        "config_exists": os.path.exists(CONFIG_FILE),
+        "current_directory": os.getcwd()
+    }
