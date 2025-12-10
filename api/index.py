@@ -1,14 +1,10 @@
-from flask import (
-    Flask,
-    render_template,
-    request,
-    jsonify,
-    send_file,
-    session,
-)
+import os
 import io
-from openpyxl import load_workbook  # ← questa mancava
+
+from flask import Flask, render_template, request, jsonify, send_file, session
+from openpyxl import load_workbook
 from werkzeug.utils import secure_filename
+
 from api.utils import (
     serialize_workbook,
     deserialize_workbook,
@@ -17,7 +13,15 @@ from api.utils import (
     generate_copy_text,
 )
 
-app = Flask(__name__)
+# Path base per trovare templates e static anche su Vercel
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+app = Flask(
+    __name__,
+    template_folder=os.path.join(BASE_DIR, "templates"),
+    static_folder=os.path.join(BASE_DIR, "static"),
+)
+
 app.secret_key = "dexcelb-super-secret-2025-v4.8"
 
 TEMPLATES = {
@@ -42,7 +46,7 @@ TEMPLATES = {
 def index():
     """
     GET  -> restituisce la pagina HTML
-    POST -> upload del DB Excel
+    POST -> upload del file Excel DB
     """
     if request.method == "POST" and "excel_file" in request.files:
         file = request.files["excel_file"]
@@ -53,7 +57,7 @@ def index():
             # Carica workbook da memoria
             wb = load_workbook(stream, data_only=True)
 
-            # Salva nella sessione come JSON
+            # Salva nella sessione in forma serializzata
             session["workbook"] = serialize_workbook(wb)
             session["headers"] = get_headers(wb)
 
@@ -77,7 +81,7 @@ def index():
 @app.route("/api/table", methods=["GET"])
 def get_table():
     """
-    Restituisce i dati della tabella in JSON.
+    Restituisce dati della tabella in JSON.
     """
     if "workbook" not in session:
         return jsonify({"error": "Nessun DB caricato"}), 400
@@ -87,7 +91,6 @@ def get_table():
 
     headers = session.get("headers") or [cell.value for cell in ws[1]]
     data = []
-
     for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
         if row_idx == 1:
             continue  # salta header
@@ -99,39 +102,38 @@ def get_table():
 @app.route("/api/mark_row", methods=["POST"])
 def mark_row():
     """
-    Aggiorna lo stato di una riga: convertita / non_conv / clear
-    row_idx: indice riga 0-based lato tabella (senza header).
+    Aggiorna lo stato di una riga:
+    payload: { "row_idx": 0-based, "status": "convertita"|"non_conv"|"clear" }
     """
     if "workbook" not in session:
         return jsonify({"error": "Nessun DB caricato"}), 400
 
     payload = request.get_json(force=True)
-    row_idx = int(payload.get("row_idx", 0))  # indice 0-based della tabella
+    row_idx = int(payload.get("row_idx", 0))
     status = payload.get("status")
 
     wb = deserialize_workbook(session["workbook"])
 
-    # +2: perché row 1 = header, row 2 = prima riga dati
+    # +2: riga 1 = header, riga 2 = prima riga dati
     excel_row_idx = row_idx + 2
-
     wb = mark_row_status(wb, excel_row_idx, status)
+
     session["workbook"] = serialize_workbook(wb)
 
     return jsonify({"success": True})
 
 
 @app.route("/api/copy_text/<int:row_idx>", methods=["GET"])
-def copy_text(row_idx):
+def copy_text(row_idx: int):
     """
     Restituisce il testo formattato per la riga selezionata.
-    row_idx: indice 0-based lato tabella.
+    row_idx: indice 0-based nella tabella (senza header).
     """
     if "workbook" not in session:
         return jsonify({"error": "Nessun DB caricato"}), 400
 
     wb = deserialize_workbook(session["workbook"])
 
-    # +2 come sopra (header + offset)
     excel_row_idx = row_idx + 2
     text = generate_copy_text(wb, excel_row_idx, TEMPLATES)
 
@@ -155,10 +157,13 @@ def download_db():
         output,
         as_attachment=True,
         download_name="dexcelb.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
     )
 
 
 if __name__ == "__main__":
-    # Per debug locale, su Vercel viene ignorato
+    # Per debug locale; su Vercel non viene usato
     app.run(debug=True)
