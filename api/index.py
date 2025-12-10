@@ -1,272 +1,334 @@
-# ===== api/index.py - COMPLETO E FUNZIONANTE =====
-
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 import os
 import io
-import uuid
-from datetime import datetime, timedelta
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils.exceptions import InvalidFileException
+import json
 
-from flask import Flask, render_template, request, jsonify, send_file
-from openpyxl import load_workbook
-from werkzeug.utils import secure_filename
+# --- COSTANTI ---
 
-from api.utils import (
-    serialize_workbook, deserialize_workbook, get_headers,
-    mark_row_status, generate_copy_text, add_row_to_workbook,
-    delete_row_from_workbook, merge_workbooks,
-    DEFAULT_TEMPLATE_CONVERTITA, DEFAULT_TEMPLATE_NON_CONV
+COL_CONVERTITA = "CONVERTITA"
+COL_NON_CONV = "PASSATA NON CONVERTITA"
+MERGE_KEY_COLS = ["NOME", "COGNOME", "ZONA"]
+DB_PATH = "db_master.xlsx" # Percorso fisso per il DB su Vercel
+CONFIG_FILE = "dexcelb_templates.json"
+
+DEFAULT_TEMPLATE_CONVERTITA = (
+    "-{NOME} {COGNOME};\n"
+    "-{TELEFONO};\n"
+    "-{MQ};\n"
+    "-{INDIRIZZO};\n"
+    "(Già chiamato, si aspetta una chiamata in giornata)"
 )
 
-# ===== CONFIG BASE =====
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-app = Flask(
-    __name__,
-    template_folder=os.path.join(BASE_DIR, "templates"),
-    static_folder=os.path.join(BASE_DIR, "static"),
+DEFAULT_TEMPLATE_NON_CONV = (
+    "-{NOME} {COGNOME};\n"
+    "-{TELEFONO};\n"
+    "-{MQ};\n"
+    "-{INDIRIZZO};\n"
+    "Passata non convertita, continuiamo a provare a contattarla."
 )
 
-app.secret_key = "dexcelb-super-secret-2025-v4.8"
+# --- FUNZIONI DI UTILITÀ EXCEL ---
 
-TEMPLATES = {
-    "convertita": DEFAULT_TEMPLATE_CONVERTITA,
-    "non_conv": DEFAULT_TEMPLATE_NON_CONV,
-}
+def trova_indice_colonna(ws, header_name):
+    num_col = ws.max_column or 0
+    for i in range(1, num_col + 1):
+        val = ws.cell(row=1, column=i).value
+        if str(val).strip().lower() == str(header_name).strip().lower():
+            return i
+    return None
 
-# ===== STORAGE IN MEMORIA CON COOKIE =====
-SESSIONS = {}
-SESSION_TIMEOUT = timedelta(hours=1)
+def carica_dati_da_file(filepath):
+    if not os.path.exists(filepath):
+        return [], []
 
+    wb = load_workbook(filepath, data_only=True)
+    ws = wb.active
 
-def cleanup_expired_sessions():
-    """Rimuove sessioni scadute"""
-    now = datetime.now()
-    expired = [sid for sid, data in SESSIONS.items() 
-               if now - data['created'] > SESSION_TIMEOUT]
-    for sid in expired:
-        del SESSIONS[sid]
+    headers = [cell.value for cell in ws[1]]
+    colonne_attuali = [
+        str(h) if h not in (None, "") else f"Colonna {i+1}"
+        for i, h in enumerate(headers)
+    ]
+    num_col = len(colonne_attuali)
 
-
-def get_or_create_session_id(request):
-    """Ottiene o crea un ID sessione dal browser"""
-    session_id = request.cookies.get("dexcelb_session_id")
-    if not session_id or session_id not in SESSIONS:
-        session_id = str(uuid.uuid4())
-        SESSIONS[session_id] = {
-            'workbook': None,
-            'headers': [],
-            'created': datetime.now()
-        }
-    return session_id
-
-
-# ===== ROUTE PRINCIPALE =====
-@app.route("/", methods=["GET", "POST"])
-def index():
-    """
-    GET  -> Restituisce la pagina HTML
-    POST -> Upload del file Excel DB
-    """
-    cleanup_expired_sessions()
-    session_id = get_or_create_session_id(request)
-    
-    if request.method == "POST" and "excel_file" in request.files:
-        file = request.files["excel_file"]
-        if file and file.filename:
-            filename = secure_filename(file.filename)
-            stream = io.BytesIO(file.read())
-            
-            try:
-                wb = load_workbook(stream, data_only=True)
-                SESSIONS[session_id]["workbook"] = serialize_workbook(wb)
-                SESSIONS[session_id]["headers"] = get_headers(wb)
-                
-                response = jsonify({
-                    "status": "DB caricato",
-                    "filename": filename,
-                    "headers": SESSIONS[session_id]["headers"],
-                })
-                response.set_cookie("dexcelb_session_id", session_id, max_age=3600, samesite="Lax")
-                return response
-            except Exception as e:
-                return jsonify({"error": f"Errore caricamento: {str(e)}"}), 400
+    righe = []
+    for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        row = list(row) if row is not None else []
+        if len(row) > num_col:
+            row = row[:num_col]
+        elif len(row) < num_col:
+            row += [None] * (num_col - len(row))
         
-        return jsonify({"error": "Nessun file selezionato"}), 400
+        righe.append({'riga_excel': row_idx, 'valori': [str(v) if v is not None else '' for v in row]})
+        
+    return colonne_attuali, righe
 
-    response = jsonify({"ok": True})
-    response.set_cookie("dexcelb_session_id", session_id, max_age=3600, samesite="Lax")
-    return render_template("index.html")
-
-
-# ===== API: TABELLA =====
-@app.route("/api/table", methods=["GET"])
-def get_table():
-    """Restituisce dati della tabella in JSON"""
-    cleanup_expired_sessions()
-    session_id = get_or_create_session_id(request)
+def importa_dati_da_buffer(db_path, file_content):
+    if not os.path.exists(db_path):
+         raise FileNotFoundError("DB master non trovato.")
     
-    if not SESSIONS[session_id]["workbook"]:
-        return jsonify({"error": "Nessun DB caricato"}), 400
-
     try:
-        wb = deserialize_workbook(SESSIONS[session_id]["workbook"])
-        ws = wb.active
-        headers = SESSIONS[session_id]["headers"] or get_headers(wb)
-        data = []
+        wb_db = load_workbook(db_path)
+        ws_db = wb_db.active
 
-        for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-            if row_idx == 1:
+        wb_src = load_workbook(io.BytesIO(file_content), data_only=True)
+        ws_src = wb_src.active
+    except InvalidFileException:
+        raise ValueError("File Excel sorgente non valido.")
+    
+    righe_copiate = 0
+    for i, row in enumerate(ws_src.iter_rows(values_only=True), start=1):
+        if i == 1:
+            continue
+        if all(cell is None for cell in row):
+            continue
+        # Assicurati che le righe abbiano lo stesso numero di colonne del master
+        master_cols = wb_db.active.max_column
+        row_list = list(row)
+        if len(row_list) > master_cols:
+            row_list = row_list[:master_cols]
+        elif len(row_list) < master_cols:
+            row_list += [None] * (master_cols - len(row_list))
+            
+        ws_db.append(row_list)
+        righe_copiate += 1
+
+    wb_db.save(db_path)
+    return righe_copiate
+
+def unisci_file_lista(master_path, file_content_list):
+    if not os.path.exists(master_path):
+        raise FileNotFoundError(f"File master non trovato: {master_path}")
+
+    wb_master = load_workbook(master_path)
+    ws_master = wb_master.active
+
+    master_headers = [cell.value for cell in ws_master[1]]
+    num_col_master = len(master_headers)
+
+    header_to_index = {
+        str(h).strip().upper(): i
+        for i, h in enumerate(master_headers)
+        if h is not None
+    }
+    
+    def costruisci_chiave(row):
+        valori = []
+        for col in MERGE_KEY_COLS:
+            idx = header_to_index.get(col.upper(), None)
+            if idx is None or idx >= len(row):
+                valori.append("")
+            else:
+                v = row[idx]
+                valori.append(str(v or "").strip().upper())
+        return "|".join(valori)
+
+    chiavi = set()
+    for i, row in enumerate(ws_master.iter_rows(values_only=True), start=1):
+        if i == 1:
+            continue
+        row = list(row) if row is not None else []
+        if all(cell is None for cell in row):
+            continue
+        key = costruisci_chiave(row)
+        if key.strip():
+            chiavi.add(key)
+
+    nuovi = 0
+    files_trovati = 0
+
+    for file_content in file_content_list:
+        files_trovati += 1
+        
+        try:
+            wb_src = load_workbook(io.BytesIO(file_content), data_only=True)
+            ws_src = wb_src.active
+        except InvalidFileException:
+            continue
+
+        for i, row in enumerate(ws_src.iter_rows(values_only=True), start=1):
+            if i == 1:
                 continue
-            data.append([str(c) if c else "" for c in row])
+            row = list(row) if row is not None else []
+            if all(cell is None for cell in row):
+                continue
 
-        return jsonify({"headers": headers, "data": data})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            if len(row) > num_col_master:
+                row = row[:num_col_master]
+            elif len(row) < num_col_master:
+                row += [None] * (num_col_master - len(row))
 
+            key = costruisci_chiave(row)
 
-# ===== API: AGGIORNA STATO RIGA =====
-@app.route("/api/mark_row", methods=["POST"])
-def mark_row():
-    """Segna riga come convertita/non_conv/clear"""
-    cleanup_expired_sessions()
-    session_id = get_or_create_session_id(request)
+            if not key.strip():
+                continue
+            if key in chiavi:
+                continue
+
+            ws_master.append(row)
+            chiavi.add(key)
+            nuovi += 1
+
+    wb_master.save(master_path)
+    return files_trovati, nuovi
+
+def aggiorna_stato_riga(db_path, riga_excel, convertita=False, non_convertita=False, pulisci=False):
+    if riga_excel == 1:
+        raise ValueError("Non è possibile modificare la riga di intestazione.")
     
-    if not SESSIONS[session_id]["workbook"]:
-        return jsonify({"error": "Nessun DB caricato"}), 400
+    if not os.path.exists(db_path):
+        raise FileNotFoundError("DB master non trovato.")
+        
+    wb = load_workbook(db_path)
+    ws = wb.active
 
-    try:
-        payload = request.get_json(force=True)
-        row_idx = int(payload.get("row_idx", 0))
-        status = payload.get("status")
+    col_conv = trova_indice_colonna(ws, COL_CONVERTITA)
+    col_non_conv = trova_indice_colonna(ws, COL_NON_CONV)
 
-        wb = deserialize_workbook(SESSIONS[session_id]["workbook"])
-        excel_row_idx = row_idx + 2
-        mark_row_status(wb, excel_row_idx, status)
-        SESSIONS[session_id]["workbook"] = serialize_workbook(wb)
+    if col_conv is None or col_non_conv is None:
+        raise KeyError(f"Colonne di stato mancanti: '{COL_CONVERTITA}' e '{COL_NON_CONV}' sono necessarie nella prima riga.")
 
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    if pulisci:
+        ws.cell(row=riga_excel, column=col_conv).value = ""
+        ws.cell(row=riga_excel, column=col_non_conv).value = ""
+    else:
+        ws.cell(row=riga_excel, column=col_conv).value = "X" if convertita else ""
+        ws.cell(row=riga_excel, column=col_non_conv).value = "X" if non_convertita else ""
 
+    wb.save(db_path)
+    return True
 
-# ===== API: COPIA TESTO =====
-@app.route("/api/copy_text/<int:row_idx>", methods=["GET"])
-def copy_text(row_idx):
-    """Genera testo formattato per riga"""
-    cleanup_expired_sessions()
-    session_id = get_or_create_session_id(request)
+def aggiungi_riga_manuale(db_path, row_values):
+    if not os.path.exists(db_path):
+        raise FileNotFoundError("DB master non trovato.")
+
+    wb = load_workbook(db_path)
+    ws = wb.active
+
+    headers = [cell.value for cell in ws[1]]
+    num_col = len(headers)
     
-    if not SESSIONS[session_id]["workbook"]:
-        return jsonify({"error": "Nessun DB caricato"}), 400
+    # Ensure row_values has the correct length
+    row_list = [str(v).strip() for v in row_values]
+    if len(row_list) > num_col:
+        row_list = row_list[:num_col]
+    elif len(row_list) < num_col:
+        row_list += [""] * (num_col - len(row_list))
 
+    ws.append(row_list)
+    wb.save(db_path)
+    return True
+
+# --- GESTIONE TEMPLATE (CONFIG FILE) ---
+
+def carica_templates():
     try:
-        wb = deserialize_workbook(SESSIONS[session_id]["workbook"])
-        excel_row_idx = row_idx + 2
-        text = generate_copy_text(wb, excel_row_idx, TEMPLATES)
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {
+                "convertita": data.get("convertita", DEFAULT_TEMPLATE_CONVERTITA),
+                "non_convertita": data.get("non_convertita", DEFAULT_TEMPLATE_NON_CONV),
+            }
+        else:
+            # Crea il file se non esiste con i default
+            salva_templates(DEFAULT_TEMPLATE_CONVERTITA, DEFAULT_TEMPLATE_NON_CONV)
+            return carica_templates()
+    except Exception:
+        return {
+            "convertita": DEFAULT_TEMPLATE_CONVERTITA,
+            "non_convertita": DEFAULT_TEMPLATE_NON_CONV,
+        }
 
-        return jsonify({"text": text})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+def salva_templates(convertita_text, non_conv_text):
+    data = {
+        "convertita": convertita_text,
+        "non_convertita": non_conv_text,
+    }
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
+# --- API ENDPOINTS (FASTAPI) ---
 
-# ===== API: INSERIMENTO MANUALE =====
-@app.route("/api/add_row", methods=["POST"])
-def add_row():
-    """Aggiunge riga manualmente"""
-    cleanup_expired_sessions()
-    session_id = get_or_create_session_id(request)
-    
-    if not SESSIONS[session_id]["workbook"]:
-        return jsonify({"error": "Nessun DB caricato"}), 400
+app = FastAPI()
 
+@app.get("/api/data")
+async def get_data():
+    """Restituisce le colonne e tutte le righe dal DB."""
     try:
-        payload = request.get_json(force=True)
-        row_values = payload.get("values", [])
-
-        wb = deserialize_workbook(SESSIONS[session_id]["workbook"])
-        add_row_to_workbook(wb, row_values)
-        SESSIONS[session_id]["workbook"] = serialize_workbook(wb)
-
-        return jsonify({"success": True})
+        colonne, righe = carica_dati_da_file(DB_PATH)
+        return {"colonne": colonne, "righe": righe, "db_name": os.path.basename(DB_PATH)}
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=f"Errore caricamento dati: {e}")
 
-
-# ===== API: ELIMINA RIGA =====
-@app.route("/api/delete_row/<int:row_idx>", methods=["POST"])
-def delete_row(row_idx):
-    """Elimina una riga"""
-    cleanup_expired_sessions()
-    session_id = get_or_create_session_id(request)
-    
-    if not SESSIONS[session_id]["workbook"]:
-        return jsonify({"error": "Nessun DB caricato"}), 400
-
+@app.post("/api/import")
+async def import_file(file: UploadFile = File(...)):
+    """Importa righe da un file Excel sorgente."""
     try:
-        wb = deserialize_workbook(SESSIONS[session_id]["workbook"])
-        excel_row_idx = row_idx + 2
-        delete_row_from_workbook(wb, excel_row_idx)
-        SESSIONS[session_id]["workbook"] = serialize_workbook(wb)
-
-        return jsonify({"success": True})
+        content = await file.read()
+        righe_copiate = importa_dati_da_buffer(DB_PATH, content)
+        return {"messaggio": f"Importazione completata. Righe copiate: {righe_copiate}"}
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=f"Errore importazione: {e}")
 
-
-# ===== API: UNISCI FILE =====
-@app.route("/api/merge", methods=["POST"])
-def merge_files():
-    """Unisce file sorgente nel DB master"""
-    cleanup_expired_sessions()
-    session_id = get_or_create_session_id(request)
-    
-    if not SESSIONS[session_id]["workbook"]:
-        return jsonify({"error": "Nessun DB caricato"}), 400
-
-    if "merge_file" not in request.files:
-        return jsonify({"error": "Nessun file da unire"}), 400
-
+@app.post("/api/merge")
+async def merge_files(files: list[UploadFile] = File(...)):
+    """Deduplica e unisce più file Excel nel DB master."""
     try:
-        file = request.files["merge_file"]
-        stream = io.BytesIO(file.read())
-
-        wb_master = deserialize_workbook(SESSIONS[session_id]["workbook"])
-        wb_source = load_workbook(stream, data_only=True)
-
-        wb_merged, count = merge_workbooks(wb_master, wb_source, ["NOME", "COGNOME", "ZONA"])
-        SESSIONS[session_id]["workbook"] = serialize_workbook(wb_merged)
-
-        return jsonify({"success": True, "imported": count})
+        file_contents = [await f.read() for f in files]
+        files_trovati, nuovi = unisci_file_lista(DB_PATH, file_contents)
+        return {"messaggio": f"Unione completata. File elaborati: {files_trovati}, Nuove righe aggiunte: {nuovi}"}
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=f"Errore unione: {e}")
 
-
-# ===== API: SCARICA DB =====
-@app.route("/download", methods=["GET"])
-def download_db():
-    """Scarica il DB Excel modificato"""
-    cleanup_expired_sessions()
-    session_id = get_or_create_session_id(request)
-    
-    if not SESSIONS[session_id]["workbook"]:
-        return jsonify({"error": "Nessun DB caricato"}), 400
-
+@app.post("/api/row/status")
+async def set_row_status(data: dict):
+    """Aggiorna lo stato CONVERTITA/NON CONVERTITA di una riga."""
     try:
-        wb = deserialize_workbook(SESSIONS[session_id]["workbook"])
-        output = io.BytesIO()
-        wb.save(output)
-        output.seek(0)
-
-        return send_file(
-            output,
-            as_attachment=True,
-            download_name="dexcelb.xlsx",
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        riga_excel = data.get('riga_excel')
+        convertita = data.get('convertita', False)
+        non_convertita = data.get('non_convertita', False)
+        pulisci = data.get('pulisci', False)
+        
+        aggiorna_stato_riga(DB_PATH, riga_excel, convertita, non_convertita, pulisci)
+        return {"messaggio": f"Stato riga {riga_excel} aggiornato."}
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=f"Errore aggiornamento stato: {e}")
 
+@app.post("/api/row/add")
+async def add_manual_row(data: dict):
+    """Aggiunge una riga al DB con i valori specificati."""
+    try:
+        row_values = data.get('values') 
+        if not row_values or not isinstance(row_values, list):
+            raise ValueError("Valori riga non validi.")
+            
+        aggiungi_riga_manuale(DB_PATH, row_values)
+        return {"messaggio": "Riga aggiunta manualmente con successo."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore aggiunta riga: {e}")
 
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.get("/api/templates")
+async def get_templates():
+    """Restituisce i template di copia."""
+    try:
+        return carica_templates()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore caricamento template: {e}")
 
-# ===== FINE api/index.py =====
+@app.post("/api/templates/save")
+async def save_templates_api(data: dict):
+    """Salva i template di copia."""
+    try:
+        conv = data.get('convertita')
+        non_conv = data.get('non_convertita')
+        if not conv or not non_conv:
+            raise ValueError("I testi dei template non possono essere vuoti.")
+            
+        salva_templates(conv, non_conv)
+        return {"messaggio": "Template salvati con successo."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore salvataggio template: {e}")

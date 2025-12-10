@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DEXCELB - Data Management Tool (Web)</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app-container">
+        <header id="app-header">
+            <h1 class="app-title">DEXCELB - Data Management Tool</h1>
+            <div class="header-controls">
+                <span id="db-status" class="db-status">DB in uso: (nessuno)</span>
+                <button id="btn-refresh" onclick="refreshData()" class="btn btn-accent-primary">🔄 Refresh</button>
+                <button id="btn-back-menu" onclick="showSection('dashboard')" class="btn btn-accent-neutral" style="display: none;">⬅️ Torna al menù</button>
+            </div>
+        </header>
+
+        <main id="main-stack">
+            <section id="dashboard" class="section-card active">
+                <h2 class="card-title">✨ Pannello di controllo</h2>
+                <p class="card-subtitle">Seleziona un'azione per gestire il tuo database clienti.</p>
+                <div class="action-grid">
+                    <div class="action-card" onclick="showSection('import')">
+                        <span class="icon" style="color: #f97316;">📥</span>
+                        <div class="card-content">
+                            <h3>Importa file Excel</h3>
+                            <p>Aggiungi rapidamente nuove righe al DB da un file sorgente.</p>
+                        </div>
+                    </div>
+                    <div class="action-card" onclick="showSection('manual')">
+                        <span class="icon" style="color: #22c55e;">✏️</span>
+                        <div class="card-content">
+                            <h3>Inserisci cliente</h3>
+                            <p>Apri il form dinamico basato sulle colonne del DB.</p>
+                        </div>
+                    </div>
+                    <div class="action-card" onclick="showSection('table')">
+                        <span class="icon" style="color: #6366f1;">📊</span>
+                        <div class="card-content">
+                            <h3>Gestisci clienti</h3>
+                            <p>Apri la tabella dove filtri, modifichi e marchi i record.</p>
+                        </div>
+                    </div>
+                    <div class="action-card" onclick="showSection('merge')">
+                        <span class="icon" style="color: #0ea5e9;">🧩</span>
+                        <div class="card-content">
+                            <h3>Unisci file Excel</h3>
+                            <p>Deduplica e unisci più file nel DB master.</p>
+                        </div>
+                    </div>
+                    <div class="action-card" onclick="showSection('templates')">
+                        <span class="icon" style="color: #e11d48;">💬</span>
+                        <div class="card-content">
+                            <h3>Gestisci testi copia</h3>
+                            <p>Personalizza i testi CONVERTITA / NON CONVERTITA.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="import" class="section-card" style="display: none;">
+                <h2 class="card-title">📥 Importa righe nel DB Excel</h2>
+                <p class="card-subtitle">Seleziona il file Excel sorgente da cui copiare i dati nel DB master.</p>
+                <div class="form-container">
+                    <label for="import-file">File da importare:</label>
+                    <input type="file" id="import-file" accept=".xlsx,.xlsm" required>
+                    <button onclick="handleImport()" class="btn btn-accent-warning">IMPORTA NEL DB</button>
+                </div>
+                <p id="import-status" class="status-message"></p>
+            </section>
+
+            <section id="manual" class="section-card" style="display: none;">
+                <h2 class="card-title">✏️ Inserisci manualmente una nuova riga</h2>
+                <p class="card-subtitle">Compila i campi e premi 'Aggiungi riga al DB'.</p>
+                <div id="manual-form-container" class="form-container scrollable-content">
+                    </div>
+                <button onclick="handleAddRow()" class="btn btn-accent-success">AGGIUNGI RIGA AL DB</button>
+                <p id="manual-status" class="status-message"></p>
+            </section>
+
+            <section id="table" class="section-card" style="display: none;">
+                <h2 class="card-title">📊 Gestisci clienti</h2>
+                <div class="filter-controls">
+                    <label for="filter-col">Colonna:</label>
+                    <select id="filter-col"></select>
+                    <label for="filter-text">Contiene:</label>
+                    <input type="text" id="filter-text" placeholder="Testo da cercare...">
+                    <button onclick="applyFilter()" class="btn btn-accent-primary">Filtra</button>
+                    <button onclick="resetFilter()" class="btn btn-neutral">Mostra tutto</button>
+                </div>
+
+                <div class="table-container">
+                    <table id="data-table">
+                        <thead>
+                            <tr></tr>
+                        </thead>
+                        <tbody>
+                            </tbody>
+                    </table>
+                </div>
+                <p id="table-status" class="status-message">Caricamento dati...</p>
+
+                <div class="action-bar">
+                    <button onclick="copyRowText()" class="btn btn-accent-neutral">💬 Copia testo</button>
+                    <button onclick="setRowStatus(true, false)" class="btn btn-accent-success">✅ Segna convertita</button>
+                    <button onclick="setRowStatus(false, true)" class="btn btn-accent-warning">⚠️ Passata non convertita</button>
+                    <button onclick="setRowStatus(false, false, true)" class="btn btn-neutral">Togli marcatura</button>
+                    </div>
+            </section>
+            
+            <section id="merge" class="section-card" style="display: none;">
+                <h2 class="card-title">🧩 Unisci file Excel nel DB attuale</h2>
+                <p class="card-subtitle">Seleziona uno o più file Excel. Verranno aggiunte solo le righe non già presenti (NOME + COGNOME + ZONA).</p>
+                <div class="form-container">
+                    <label for="merge-files">Seleziona file Excel:</label>
+                    <input type="file" id="merge-files" accept=".xlsx,.xlsm" multiple required>
+                    <button onclick="handleMerge()" class="btn btn-accent-primary">UNISCI ORA NEL DB</button>
+                </div>
+                <div id="merge-file-list" class="scrollable-content file-list-box">Nessun file selezionato.</div>
+                <p id="merge-status" class="status-message"></p>
+            </section>
+
+            <section id="templates" class="section-card" style="display: none;">
+                <h2 class="card-title">💬 Testi per copia riga</h2>
+                <p class="card-subtitle">Personalizza i testi usati quando copi una riga. Usare i segnaposto: {NOME}, {COGNOME}, {TELEFONO}, {MQ}, {INDIRIZZO}.</p>
+                <div class="templates-grid">
+                    <div class="template-box">
+                        <label for="tpl-convertita" class="template-label success">Testo per CONVERTITA</label>
+                        <textarea id="tpl-convertita" rows="8"></textarea>
+                    </div>
+                    <div class="template-box">
+                        <label for="tpl-non-convertita" class="template-label warning">Testo per PASSATA NON CONVERTITA</label>
+                        <textarea id="tpl-non-convertita" rows="8"></textarea>
+                    </div>
+                </div>
+                <button onclick="saveTemplates()" class="btn btn-accent-success">✅ SALVA TESTI</button>
+                <p id="templates-status" class="status-message"></p>
+            </section>
+
+        </main>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
