@@ -16,7 +16,6 @@ from api.utils import (
     DEFAULT_TEMPLATE_CONVERTITA, DEFAULT_TEMPLATE_NON_CONV
 )
 
-# ===== CONFIG BASE =====
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 app = Flask(
@@ -33,10 +32,8 @@ TEMPLATES = {
 }
 
 
-# ===== ROUTE PRINCIPALE =====
 @app.route("/", methods=["GET", "POST"])
 def index():
-    """Upload del DB principale"""
     if request.method == "POST" and "excel_file" in request.files:
         file = request.files["excel_file"]
         if file and file.filename:
@@ -60,10 +57,8 @@ def index():
     )
 
 
-# ===== API: TABELLA =====
 @app.route("/api/table", methods=["GET"])
 def get_table():
-    """Ritorna dati tabella"""
     if "workbook" not in session:
         return jsonify({"error": "No DB"}), 400
 
@@ -80,10 +75,8 @@ def get_table():
     return jsonify({"headers": headers, "data": data})
 
 
-# ===== API: AGGIORNA STATO RIGA =====
 @app.route("/api/mark_row", methods=["POST"])
 def mark_row():
-    """Segna riga come convertita/non_conv/clear"""
     if "workbook" not in session:
         return jsonify({"error": "No DB"}), 400
 
@@ -92,7 +85,7 @@ def mark_row():
     status = payload.get("status")
 
     wb = deserialize_workbook(session["workbook"])
-    excel_row_idx = row_idx + 2  # +1 header, +1 offset
+    excel_row_idx = row_idx + 2
     mark_row_status(wb, excel_row_idx, status)
     session["workbook"] = serialize_workbook(wb)
     session.modified = True
@@ -100,10 +93,8 @@ def mark_row():
     return jsonify({"success": True})
 
 
-# ===== API: COPIA TESTO =====
 @app.route("/api/copy_text/<int:row_idx>", methods=["GET"])
 def copy_text(row_idx):
-    """Genera testo formattato per riga"""
     if "workbook" not in session:
         return jsonify({"error": "No DB"}), 400
 
@@ -114,10 +105,8 @@ def copy_text(row_idx):
     return jsonify({"text": text})
 
 
-# ===== API: INSERIMENTO MANUALE =====
 @app.route("/api/add_row", methods=["POST"])
 def add_row():
-    """Aggiunge riga manualmente compilando form"""
     if "workbook" not in session:
         return jsonify({"error": "No DB"}), 400
 
@@ -132,5 +121,58 @@ def add_row():
     return jsonify({"success": True})
 
 
-# ===== API: ELIMINA RIGA =====
-@app.route("/api/delete_row/<int:row_idx>", methods=
+@app.route("/api/delete_row/<int:row_idx>", methods=["POST"])
+def delete_row(row_idx):
+    if "workbook" not in session:
+        return jsonify({"error": "No DB"}), 400
+
+    wb = deserialize_workbook(session["workbook"])
+    excel_row_idx = row_idx + 2
+    delete_row_from_workbook(wb, excel_row_idx)
+    session["workbook"] = serialize_workbook(wb)
+    session.modified = True
+
+    return jsonify({"success": True})
+
+
+@app.route("/api/merge", methods=["POST"])
+def merge_files():
+    if "workbook" not in session:
+        return jsonify({"error": "No DB"}), 400
+
+    if "merge_file" not in request.files:
+        return jsonify({"error": "No file"}), 400
+
+    file = request.files["merge_file"]
+    stream = io.BytesIO(file.read())
+
+    wb_master = deserialize_workbook(session["workbook"])
+    wb_source = load_workbook(stream, data_only=True)
+
+    wb_merged, count = merge_workbooks(wb_master, wb_source, ["NOME", "COGNOME", "ZONA"])
+    session["workbook"] = serialize_workbook(wb_merged)
+    session.modified = True
+
+    return jsonify({"success": True, "imported": count})
+
+
+@app.route("/download", methods=["GET"])
+def download_db():
+    if "workbook" not in session:
+        return jsonify({"error": "No DB"}), 400
+
+    wb = deserialize_workbook(session["workbook"])
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name="dexcelb.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
