@@ -1,4 +1,4 @@
-const API_URL = '/api'; // Vercel gestirà il routing
+const API_URL = '/api';
 const COL_CONVERTITA = "CONVERTITA";
 const COL_NON_CONV = "PASSATA NON CONVERTITA";
 
@@ -6,12 +6,23 @@ let currentData = { colonne: [], righe: [], db_name: '(nessuno)' };
 let currentTemplates = {};
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Inizializzazione e verifica diagnostica all'avvio
+    console.log("Frontend loaded. Attempting to refresh data.");
+    
+    // DEBUG: Verifica se il DB è stato trovato, e avvisa l'utente
+    fetch('/api/diagnostics').then(r => r.json()).then(data => {
+        if (!data.db_exists) {
+            document.getElementById('db-status').textContent = `DB in uso: ATTENZIONE! Manca db_master.xlsx`;
+            document.getElementById('db-status').style.color = '#dc2626';
+        }
+    });
+
     refreshData();
     document.getElementById('merge-files').addEventListener('change', updateMergeFileList);
     loadTemplates();
 });
 
-// --- FUNZIONI UTILITY ---
+// --- FUNZIONI UTILITY E API ---
 
 function showSection(sectionId) {
     document.querySelectorAll('#main-stack > section').forEach(section => {
@@ -37,14 +48,19 @@ function showSection(sectionId) {
 async function apiFetch(endpoint, options = {}) {
     try {
         const response = await fetch(`${API_URL}${endpoint}`, options);
+        
+        if (response.status === 404) {
+             throw new Error("Endpoint API non trovato (404). Controlla il routing Vercel o il percorso dell'endpoint.");
+        }
+
         if (!response.ok) {
             const error = await response.json();
             throw new Error(error.detail || `Errore HTTP: ${response.status}`);
         }
         return await response.json();
     } catch (error) {
-        console.error("API Error:", error);
-        alert(`Errore: ${error.message}`);
+        console.error("API Error:", endpoint, error);
+        alert(`Errore API (${endpoint}): ${error.message}`);
         return null;
     }
 }
@@ -52,12 +68,14 @@ async function apiFetch(endpoint, options = {}) {
 function updateStatus(id, message, isError = false) {
     const el = document.getElementById(id);
     el.textContent = message;
-    el.style.color = isError ? '#dc2626' : '#4ade80';
+    el.style.color = isError ? '#dc2626' : '#22c55e'; // Verde per successo
 }
 
 // --- GESTIONE DATI E UI ---
 
 async function refreshData() {
+    document.getElementById('btn-refresh').disabled = true;
+
     const data = await apiFetch('/data');
     if (data) {
         currentData = data;
@@ -86,6 +104,7 @@ async function refreshData() {
              renderManualForm();
         }
     }
+    document.getElementById('btn-refresh').disabled = false;
 }
 
 function renderTable(righe) {
@@ -95,7 +114,7 @@ function renderTable(righe) {
     tableBody.innerHTML = '';
 
     if (!currentData.colonne || currentData.colonne.length === 0) {
-        document.getElementById('table-status').textContent = "Nessuna colonna nel DB.";
+        document.getElementById('table-status').textContent = "Nessuna colonna nel DB. Importa un file per iniziare.";
         return;
     }
 
@@ -121,7 +140,7 @@ function renderTable(righe) {
         }
         tr.className = rowClass;
         
-        // Data attribute per identificare la riga Excel e i valori
+        // Data attribute per identificare la riga Excel
         tr.dataset.rigaExcel = riga.riga_excel;
         tr.dataset.valori = JSON.stringify(riga.valori);
 
@@ -147,10 +166,6 @@ function renderTable(righe) {
         
         tableBody.appendChild(tr);
     });
-
-    const righeCount = righe.length;
-    const clientiCount = righe.length > 0 ? righe.length - 1 : 0;
-    document.getElementById('table-status').textContent = `Righe visualizzate: ${righeCount} | Clienti: ${clientiCount}`;
 }
 
 // --- GESTIONE TABELLA (FILTRI / STATO) ---
@@ -159,14 +174,20 @@ function applyFilter() {
     const colName = document.getElementById('filter-col').value;
     const searchText = document.getElementById('filter-text').value.toLowerCase().trim();
 
-    if (!colName || searchText === '') {
-        renderTable(currentData.righe);
+    if (!colName) {
+        alert("Seleziona una colonna per filtrare.");
+        return;
+    }
+    
+    // Se la ricerca è vuota, resetta
+    if (searchText === '') {
+        resetFilter();
         return;
     }
 
     const colIndex = currentData.colonne.indexOf(colName);
     if (colIndex === -1) {
-        renderTable(currentData.righe);
+        alert(`Colonna ${colName} non trovata.`);
         return;
     }
 
@@ -210,8 +231,10 @@ async function setRowStatus(convertita, non_convertita, pulisci = false) {
 
     document.querySelector('.action-bar').style.opacity = '1';
     if (result) {
-        alert(result.messaggio);
+        updateStatus('table-status', result.messaggio);
         await refreshData();
+    } else {
+         updateStatus('table-status', 'Errore nell\'aggiornamento dello stato.', true);
     }
 }
 
@@ -259,7 +282,7 @@ function copyRowText() {
     // Copia negli appunti
     navigator.clipboard.writeText(testoCopiato.trim())
         .then(() => alert("Testo copiato negli appunti!"))
-        .catch(err => alert("Errore nella copia: " + err));
+        .catch(err => alert("Errore nella copia. (Permessi non concessi): " + err));
 }
 
 // --- GESTIONE IMPORTAZIONE ---
@@ -273,6 +296,7 @@ async function handleImport() {
     }
     
     updateStatus('import-status', 'Importazione in corso...', false);
+    document.getElementById('import').style.opacity = '0.5';
     
     const formData = new FormData();
     formData.append('file', file);
@@ -282,6 +306,7 @@ async function handleImport() {
         body: formData,
     });
     
+    document.getElementById('import').style.opacity = '1';
     if (result) {
         updateStatus('import-status', result.messaggio);
         fileInput.value = ''; // Resetta il campo file
@@ -298,13 +323,9 @@ function renderManualForm() {
     container.innerHTML = '';
     
     if (!currentData.colonne || currentData.colonne.length === 0) {
-        container.innerHTML = `<p class="card-subtitle">Seleziona prima un DB valido.</p>`;
+        container.innerHTML = `<p class="card-subtitle" style="color: #f97316;">Seleziona un DB valido e caricalo (Importa un file) prima di poter inserire righe.</p>`;
         return;
     }
-    
-    // Crea un div che sarà lo scrollable container
-    const formGrid = document.createElement('div');
-    formGrid.className = 'manual-form-grid';
     
     currentData.colonne.forEach((col, index) => {
         const label = document.createElement('label');
@@ -323,8 +344,8 @@ function renderManualForm() {
 
 async function handleAddRow() {
     const inputs = document.querySelectorAll('#manual-form-container input');
-    if (inputs.length === 0) {
-        alert("Carica prima il DB per generare i campi.");
+    if (inputs.length === 0 || !currentData.colonne || currentData.colonne.length === 0) {
+        alert("Carica prima il DB o crea le colonne (Importa un file) per generare i campi.");
         return;
     }
     
@@ -336,6 +357,7 @@ async function handleAddRow() {
     }
     
     updateStatus('manual-status', 'Aggiunta riga in corso...', false);
+    document.getElementById('manual').style.opacity = '0.5';
 
     const result = await apiFetch('/row/add', {
         method: 'POST',
@@ -343,6 +365,7 @@ async function handleAddRow() {
         body: JSON.stringify({ values: rowValues })
     });
     
+    document.getElementById('manual').style.opacity = '1';
     if (result) {
         updateStatus('manual-status', result.messaggio);
         inputs.forEach(input => input.value = ''); // Pulisci i campi
@@ -420,6 +443,7 @@ async function saveTemplates() {
     }
     
     updateStatus('templates-status', 'Salvataggio in corso...', false);
+    document.getElementById('templates').style.opacity = '0.5';
 
     const result = await apiFetch('/templates/save', {
         method: 'POST',
@@ -427,6 +451,7 @@ async function saveTemplates() {
         body: JSON.stringify({ convertita: convText, non_convertita: nonConvText })
     });
 
+    document.getElementById('templates').style.opacity = '1';
     if (result) {
         updateStatus('templates-status', result.messaggio);
         // Aggiorna i template in memoria per la copia
